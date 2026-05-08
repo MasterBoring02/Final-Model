@@ -1,282 +1,281 @@
 import streamlit as st
 from streamlit_webrtc import webrtc_streamer, VideoProcessorBase
 import av
+import cv2
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torchvision.transforms as transforms
+from torchvision import models
+import numpy as np
+from PIL import Image
+from pathlib import Path
 
-st.set_page_config(page_title="Emotion Detection")
+st.set_page_config(page_title="Realtime Emotion Detection")
+
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+EMOTIONS = ['happy', 'sad', 'angry']
+
+BASE_DIR = Path(__file__).resolve().parent
+
+RESNET_ENCODER_PATH = BASE_DIR / "resnet50_encoder_best.pth"
+DCNN_FUSED_PATH = BASE_DIR / "dcnn_fused_best.pth"
+
+transform = transforms.Compose([
+    transforms.Resize((224,224)),
+    transforms.ToTensor(),
+    transforms.Normalize(
+        mean=[0.485,0.456,0.406],
+        std=[0.229,0.224,0.225]
+    )
+])
+
+class DCNN(nn.Module):
+
+    def __init__(self, input_dim=265, n_classes=3):
+        super().__init__()
+
+        self.fc1 = nn.Linear(input_dim, 512)
+        self.bn1 = nn.BatchNorm1d(512)
+        self.drop1 = nn.Dropout(0.5)
+
+        self.fc2 = nn.Linear(512, 256)
+        self.bn2 = nn.BatchNorm1d(256)
+        self.drop2 = nn.Dropout(0.4)
+
+        self.fc3 = nn.Linear(256, 128)
+        self.bn3 = nn.BatchNorm1d(128)
+        self.drop3 = nn.Dropout(0.3)
+
+        self.out = nn.Linear(128, n_classes)
+
+    def forward(self, x):
+
+        x = F.relu(self.bn1(self.fc1(x)))
+        x = self.drop1(x)
+
+        x = F.relu(self.bn2(self.fc2(x)))
+        x = self.drop2(x)
+
+        x = F.relu(self.bn3(self.fc3(x)))
+        x = self.drop3(x)
+
+        return self.out(x)
+
+def make_resnet_encoder(embed_size=128):
+
+    model = models.resnet50(weights=None)
+
+    num_ftrs = model.fc.in_features
+
+    model.fc = nn.Linear(num_ftrs, embed_size)
+
+    return model
+
+@st.cache_resource
+def load_models():
+
+    resnet = make_resnet_encoder().to(DEVICE)
+
+    resnet.load_state_dict(
+        torch.load(
+            str(RESNET_ENCODER_PATH),
+            map_location=DEVICE
+        )
+    )
+
+    dcnn = DCNN().to(DEVICE)
+
+    dcnn.load_state_dict(
+        torch.load(
+            str(DCNN_FUSED_PATH),
+            map_location=DEVICE
+        )
+    )
+
+    resnet.eval()
+    dcnn.eval()
+
+    return resnet, dcnn
+
+resnet, dcnn = load_models()
+
+face_detector = cv2.CascadeClassifier(
+    cv2.data.haarcascades + 'haarcascade_frontalface_default.xml'
+)
+
+profile_detector = cv2.CascadeClassifier(
+    cv2.data.haarcascades + 'haarcascade_profileface.xml'
+)
 
 class EmotionProcessor(VideoProcessorBase):
 
     def recv(self, frame):
 
-        global tracker
-        global tracking
-        global locked_label
-        global locked_conf
-        global locked_cheek
-        global cheek_smooth
-        global change_counter
+        img = frame.to_ndarray(format="bgr24")
 
-        frame = frame.to_ndarray(format="bgr24")
+        img = cv2.flip(img, 1)
 
-        frame = cv2.flip(frame, 1)
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
 
-        small = cv2.resize(frame, (256,192))
-
-        rgb = cv2.cvtColor(
-            small,
-            cv2.COLOR_BGR2RGB
+        faces = profile_detector.detectMultiScale(
+            gray,
+            scaleFactor=1.1,
+            minNeighbors=5,
+            minSize=(80,80)
         )
 
-        res = mp_face_mesh.process(rgb)
+        profile_side = "right"
 
-        if res.multi_face_landmarks:
+        if len(faces) == 0:
 
-            lm = res.multi_face_landmarks[0].landmark
+            flipped = cv2.flip(gray, 1)
 
-            h, w, _ = small.shape
+            flipped_faces = profile_detector.detectMultiScale(
+                flipped,
+                scaleFactor=1.1,
+                minNeighbors=5,
+                minSize=(80,80)
+            )
 
-            left_outer = lm[33]
-            left_inner = lm[133]
+            if len(flipped_faces) > 0:
 
-            right_inner = lm[362]
-            right_outer = lm[263]
+                profile_side = "left"
 
-            left_w = abs(left_outer.x - left_inner.x)
-            right_w = abs(right_outer.x - right_inner.x)
+                for (x,y,w,h) in flipped_faces:
 
-            ratio = left_w / (right_w + 1e-6)
+                    x = gray.shape[1] - x - w
 
-            show_left = False
-            show_right = False
+                    faces = [(x,y,w,h)]
 
-            if ratio < 0.65:
+                    break
 
-                show_right = True
+        if len(faces) == 0:
 
-            elif ratio > 1.5:
+            faces = face_detector.detectMultiScale(
+                gray,
+                scaleFactor=1.1,
+                minNeighbors=5,
+                minSize=(80,80)
+            )
 
-                show_left = True
+            profile_side = "front"
 
-            else:
+        for (x,y,w,h) in faces:
 
-                tracking = False
-                tracker = None
+            face = img[y:y+h, x:x+w]
 
-            if show_left or show_right:
+            if face.size == 0:
+                continue
 
-                if not tracking:
+            pil = Image.fromarray(
+                cv2.cvtColor(face, cv2.COLOR_BGR2RGB)
+            ).resize((224,224))
 
-                    pts = np.array([
-                        [int(p.x*w), int(p.y*h)]
-                        for p in lm
-                    ])
+            x_t = transform(pil).unsqueeze(0).to(DEVICE)
 
-                    x1, y1 = pts.min(axis=0)
-                    x2, y2 = pts.max(axis=0)
+            with torch.no_grad():
+                emb = resnet(x_t)
 
-                    box = (
-                        x1,
-                        y1,
-                        x2 - x1,
-                        y2 - y1
+            emb = emb.cpu().numpy().squeeze()
+
+            cheek_width = w / (h + 1e-6)
+
+            pseudo_landmarks = np.array([
+                x, y,
+                x+w, y,
+                x, y+h,
+                x+w, y+h
+            ])
+
+            padding = np.zeros(136 - len(pseudo_landmarks))
+
+            lm_flat = np.concatenate([
+                pseudo_landmarks,
+                padding
+            ])
+
+            fused = np.concatenate([
+                emb,
+                lm_flat,
+                [cheek_width]
+            ])
+
+            x_tensor = torch.tensor(
+                fused,
+                dtype=torch.float32
+            ).unsqueeze(0).to(DEVICE)
+
+            with torch.no_grad():
+
+                probs = torch.softmax(
+                    dcnn(x_tensor),
+                    dim=1
+                ).cpu().numpy().squeeze()
+
+            idx = np.argmax(probs)
+
+            emotion = EMOTIONS[idx]
+            confidence = probs[idx] * 100
+
+            cv2.rectangle(
+                img,
+                (x,y),
+                (x+w,y+h),
+                (0,255,0),
+                2
+            )
+
+            if profile_side == "left":
+
+                for i in range(9):
+
+                    px = int(x + w*0.18 + i*4)
+                    py = int(y + h*0.45 + np.sin(i)*6)
+
+                    cv2.circle(
+                        img,
+                        (px, py),
+                        4,
+                        (0,255,255),
+                        -1
                     )
 
-                    tracker = cv2.TrackerKCF_create()
+            elif profile_side == "right":
 
-                    tracker.init(
-                        small,
-                        box
+                for i in range(9):
+
+                    px = int(x + w*0.78 - i*4)
+                    py = int(y + h*0.45 + np.sin(i)*6)
+
+                    cv2.circle(
+                        img,
+                        (px, py),
+                        4,
+                        (255,255,0),
+                        -1
                     )
 
-                    tracking = True
-
-                ok, box = tracker.update(small)
-
-                if ok:
-
-                    x, y, bw, bh = map(int, box)
-
-                    face = small[y:y+bh, x:x+bw]
-
-                    if face.size != 0:
-
-                        pil = Image.fromarray(
-                            cv2.cvtColor(
-                                face,
-                                cv2.COLOR_BGR2RGB
-                            )
-                        ).resize((224,224))
-
-                        x_t = eval_tf(pil).unsqueeze(0).to(DEVICE)
-
-                        with torch.no_grad():
-
-                            emb = resnet(x_t)
-
-                        emb = emb.cpu().numpy().squeeze()
-
-                        pts = np.array([
-                            [int(p.x*w), int(p.y*h)]
-                            for p in lm
-                        ])
-
-                        if pts.shape[0] >= 68:
-                            lm_flat = pts[:68].flatten()
-                        else:
-                            lm_flat = np.zeros(136)
-
-                        cheek_raw = np.linalg.norm(
-                            pts[234] - pts[454]
-                        ) / (
-                            np.linalg.norm(
-                                pts[152] - pts[10]
-                            ) + 1e-6
-                        )
-
-                        if cheek_smooth is None:
-                            cheek_smooth = cheek_raw
-                        else:
-                            cheek_smooth = (
-                                0.8 * cheek_smooth +
-                                0.2 * cheek_raw
-                            )
-
-                        fused = np.concatenate([
-                            emb,
-                            lm_flat,
-                            [cheek_smooth]
-                        ])
-
-                        x_tensor = torch.tensor(
-                            fused,
-                            dtype=torch.float32
-                        ).unsqueeze(0).to(DEVICE)
-
-                        with torch.no_grad():
-
-                            probs = torch.softmax(
-                                dcnn(x_tensor),
-                                dim=1
-                            ).cpu().numpy().squeeze()
-
-                        sad_idx = EMOTIONS.index('sad')
-                        angry_idx = EMOTIONS.index('angry')
-
-                        if probs[sad_idx] > probs[angry_idx]:
-                            probs[sad_idx] *= 1.08
-                        else:
-                            probs[angry_idx] *= 1.08
-
-                        probs = probs / np.sum(probs)
-
-                        idx = np.argmax(probs)
-
-                        conf = float(probs[idx])
-
-                        label = EMOTIONS[idx]
-
-                        if locked_label is None:
-
-                            locked_label = label
-                            locked_conf = conf
-                            locked_cheek = cheek_smooth
-
-                        else:
-
-                            if label != locked_label:
-
-                                if conf > 0.6:
-                                    change_counter += 1
-
-                            else:
-
-                                change_counter = max(
-                                    change_counter - 1,
-                                    0
-                                )
-
-                            if (
-                                change_counter >= SWITCH_THRESHOLD
-                                or
-                                conf > locked_conf + CONF_BOOST_THRESHOLD
-                            ):
-
-                                locked_label = label
-                                locked_conf = conf
-                                locked_cheek = cheek_smooth
-
-                                change_counter = 0
-
-                        final_label = locked_label
-                        final_conf = locked_conf
-                        final_cheek = locked_cheek
-
-                        sx = frame.shape[1] / 256
-                        sy = frame.shape[0] / 192
-
-                        x1 = int(x * sx)
-                        y1 = int(y * sy)
-
-                        x2 = int((x+bw) * sx)
-                        y2 = int((y+bh) * sy)
-
-                        cv2.rectangle(
-                            frame,
-                            (x1,y1),
-                            (x2,y2),
-                            (0,255,0),
-                            2
-                        )
-
-                        if show_left:
-
-                            for idx_pt in LEFT_CHEEK_ARCH:
-
-                                px = int(pts[idx_pt][0] * sx)
-                                py = int(pts[idx_pt][1] * sy)
-
-                                cv2.circle(
-                                    frame,
-                                    (px, py),
-                                    4,
-                                    (0,255,255),
-                                    -1
-                                )
-
-                        elif show_right:
-
-                            for idx_pt in RIGHT_CHEEK_ARCH:
-
-                                px = int(pts[idx_pt][0] * sx)
-                                py = int(pts[idx_pt][1] * sy)
-
-                                cv2.circle(
-                                    frame,
-                                    (px, py),
-                                    4,
-                                    (255,255,0),
-                                    -1
-                                )
-
-                        cv2.putText(
-                            frame,
-                            f"{final_label} ({final_conf*100:.1f}%)",
-                            (x1, y1-10),
-                            cv2.FONT_HERSHEY_SIMPLEX,
-                            0.6,
-                            (255,255,255),
-                            2
-                        )
+            cv2.putText(
+                img,
+                f"{emotion} ({confidence:.1f}%)",
+                (x, y - 10),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.7,
+                (255,255,255),
+                2
+            )
 
         return av.VideoFrame.from_ndarray(
-            frame,
+            img,
             format="bgr24"
         )
 
 st.title("Realtime Emotion Detection")
 
 webrtc_streamer(
-    key="emotion",
+    key="emotion-detection",
     video_processor_factory=EmotionProcessor,
     media_stream_constraints={
         "video": True,
