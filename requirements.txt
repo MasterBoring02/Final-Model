@@ -1,0 +1,8 @@
+streamlit==1.37.1
+opencv-python-headless==4.10.0.84
+numpy==1.26.4
+Pillow==10.4.0
+protobuf==4.25.3
+mediapipe==0.10.14
+torch==2.2.2
+torchvision==0.17.2
