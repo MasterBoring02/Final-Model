@@ -6,7 +6,7 @@ import torchvision.transforms as transforms
 from torchvision import models
 import numpy as np
 from PIL import Image
-import mediapipe as mp
+from mediapipe.python.solutions import face_mesh
 from pathlib import Path
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -90,7 +90,7 @@ dcnn.load_state_dict(
 resnet.eval()
 dcnn.eval()
 
-mp_face_mesh = mp.solutions.face_mesh.FaceMesh(
+mp_face_mesh = face_mesh.FaceMesh(
     static_image_mode=False,
     max_num_faces=1,
     refine_landmarks=False,
@@ -108,7 +108,7 @@ RIGHT_CHEEK_ARCH = [
     346, 347, 348, 349
 ]
 
-cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)
+cap = cv2.VideoCapture(0)
 
 if not cap.isOpened():
     exit()
@@ -383,16 +383,6 @@ while True:
                         (255,255,255),
                         2
                     )
-
-            else:
-
-                tracking = False
-                tracker = None
-
-    else:
-
-        tracking = False
-        tracker = None
 
     cv2.imshow(
         "Emotion Detection",
